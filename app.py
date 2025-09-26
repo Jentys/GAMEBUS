@@ -1,11 +1,11 @@
 # GAME BUS MTY - Streamlit App
 # FullCalendar + Map Picker (sin key conflict) + Orden meses + Casillas + Editor
-# FIX v7.2  — arregla data_editor: Hora como time y Fecha como date
+# FIX v7.3 — agrega "Hora fin" (finalización) en captura/edición/lista/calendario/ICS
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 import json
 import io
 import os
@@ -19,7 +19,7 @@ try:
 except Exception:
     HAS_MAP = False
 
-print(">> GAME BUS MTY app - FIX v7.2")
+print(">> GAME BUS MTY app - FIX v7.3 (Hora fin)")
 
 st.set_page_config(page_title="GAME BUS MTY", page_icon="🎮", layout="wide")
 
@@ -52,7 +52,7 @@ def month_to_num(mes_str: str) -> int:
 
 def ensure_eventlog_columns(df: pd.DataFrame) -> pd.DataFrame:
     need_cols = [
-        "ID","Fecha","Hora","Nombre","Dirección","Teléfono",
+        "ID","Fecha","Hora","Hora fin","Nombre","Dirección","Teléfono",
         "Colonia/Zona","Paquete","Precio (MXN)","Add-on Pizza (Sí/No)",
         "Margen Pizza (MXN)","Retro exterior (Sí/No)","Costo variable (MXN)","Notas","Estatus"
     ]
@@ -115,20 +115,32 @@ def compute_funnel_metrics(row):
     row["Tasa de cierre (%)"] = (reservas / citas * 100) if citas else 0
     return row
 
+def _combine_dt(fecha_val, hora_val, fallback="10:00"):
+    """Combina fecha + hora a datetime; hora puede venir None/NaN/str/time."""
+    f = pd.to_datetime(fecha_val, errors="coerce")
+    if pd.isna(f):
+        return None
+    h_str = fallback
+    if pd.notna(hora_val) and str(hora_val).strip():
+        try:
+            h_dt = pd.to_datetime(str(hora_val), errors="coerce")
+            if pd.notna(h_dt):
+                h_str = h_dt.strftime("%H:%M")
+        except Exception:
+            pass
+    return datetime.combine(f.date(), datetime.strptime(h_str, "%H:%M").time())
+
 def to_ics(df_events):
     lines = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//GAME BUS MTY//Agenda//ES"]
     for _, r in df_events.iterrows():
-        f = pd.to_datetime(r["Fecha"], errors="coerce")
-        if pd.isna(f): continue
-        try:
-            if pd.notna(r.get("Hora")) and str(r.get("Hora")).strip():
-                h = pd.to_datetime(str(r["Hora"]), errors="coerce").time()
-                if pd.isna(h): h = datetime.strptime("10:00","%H:%M").time()
-            else:
-                h = datetime.strptime("10:00","%H:%M").time()
-            dtstart = datetime.combine(f.date(), h)
-        except Exception:
-            dtstart = datetime.combine(f.date(), datetime.strptime("10:00","%H:%M").time())
+        dtstart = _combine_dt(r.get("Fecha"), r.get("Hora"), "10:00")
+        if not dtstart: 
+            continue
+        # DTEND: usa Hora fin o +2h
+        dtend = _combine_dt(r.get("Fecha"), r.get("Hora fin"), dtstart.strftime("%H:%M"))
+        if not dtend or dtend <= dtstart:
+            dtend = dtstart + timedelta(hours=2)
+
         uid = f"{dtstart.strftime('%Y%m%dT%H%M%S')}-gamebus@agenda"
         title = f"Evento: {r.get('Nombre','Cliente')} - ${r.get('Precio (MXN)',0):,.0f}"
         loc = r.get("Dirección","")
@@ -143,6 +155,7 @@ def to_ics(df_events):
             f"UID:{uid}",
             f"DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}",
             f"DTSTART:{dtstart.strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND:{dtend.strftime('%Y%m%dT%H%M%S')}",
             f"SUMMARY:{title}",
             f"LOCATION:{loc}",
             f"DESCRIPTION:{desc}",
@@ -345,6 +358,7 @@ def build_fullcalendar_html(events_json, initial_date=None):
           const p = document.getElementById('popover');
           const props = e.extendedProps || {{}};
           const hora = e.start ? e.start.toLocaleTimeString('es-MX', {{hour:'2-digit', minute:'2-digit'}}) : '';
+          const horaFin = e.end ? e.end.toLocaleTimeString('es-MX', {{hour:'2-digit', minute:'2-digit'}}) : '';
           const paquete = props.paquete || '';
           const dir = props.direccion || '';
           const mapSrc = dir ? 'https://www.google.com/maps?q=' + encodeURIComponent(dir) + '&output=embed' : '';
@@ -355,7 +369,7 @@ def build_fullcalendar_html(events_json, initial_date=None):
           p.innerHTML = `
             <h4>${{e.title}}</h4>
             <p><strong>Tipo de servicio:</strong> <span class="badge">${{paquete}}</span></p>
-            <p><strong>Hora del servicio:</strong> ${{hora}}</p>
+            <p><strong>Hora del servicio:</strong> ${{hora}} ${{horaFin ? '— ' + horaFin : ''}}</p>
             ${{ dir ? `<p><strong>Dirección:</strong> ${{dir}}</p>` : '' }}
             ${{ mapSrc ? `<iframe class="mapbox" loading="lazy" referrerpolicy="no-referrer-when-downgrade" src="${{mapSrc}}"></iframe>` : '' }}
             <div class="btns" style="margin-top:8px;">
@@ -386,38 +400,41 @@ def events_to_fullcalendar(ev_df):
         return []
     df = ev_df.copy()
     df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+
     def build_iso(row):
         d = row["Fecha"]
         if pd.isna(d):
-            return None
-        h = "10:00"
-        if pd.notna(row.get("Hora")) and str(row.get("Hora")).strip():
-            try:
-                h_dt = pd.to_datetime(str(row["Hora"]), errors="coerce")
-                if pd.notna(h_dt):
-                    h = h_dt.strftime("%H:%M")
-            except Exception:
-                pass
-        return f"{d.strftime('%Y-%m-%d')}T{h}:00"
-    df["_start"] = df.apply(build_iso, axis=1)
-
-    def color_for(paquete, estatus):
-        p = str(paquete or "").strip().lower()
-        if str(estatus).lower() == "pendiente":
-            return "#3b82f6"
-        if "retro" in p and "clásico" in p: return "#7c3aed"
-        if "retro" in p: return "#ef4444"
-        if "clásico" in p: return "#10b981"
-        return "#6b7280"
+            return None, None
+        # start
+        start_dt = _combine_dt(d, row.get("Hora"), "10:00")
+        if not start_dt:
+            return None, None
+        # end: Hora fin o +2h
+        end_dt = _combine_dt(d, row.get("Hora fin"), start_dt.strftime("%H:%M"))
+        if (not end_dt) or end_dt <= start_dt:
+            end_dt = start_dt + timedelta(hours=2)
+        return start_dt.strftime("%Y-%m-%dT%H:%M:%S"), end_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     events = []
     for _, r in df.iterrows():
-        start = r.get("_start")
-        if not start: continue
+        start, end = build_iso(r)
+        if not start:
+            continue
         title = r.get("Nombre") or r.get("Colonia/Zona") or "Evento"
+        # color
+        def color_for(paquete, estatus):
+            p = str(paquete or "").strip().lower()
+            if str(estatus).lower() == "pendiente":
+                return "#3b82f6"
+            if "retro" in p and "clásico" in p: return "#7c3aed"
+            if "retro" in p: return "#ef4444"
+            if "clásico" in p: return "#10b981"
+            return "#6b7280"
+
         events.append({
             "title": f"{title} ({r.get('Estatus','Pendiente')})",
             "start": start,
+            "end": end,
             "color": color_for(r.get("Paquete"), r.get("Estatus")),
             "extendedProps": {
                 "paquete": r.get("Paquete", ""),
@@ -491,6 +508,9 @@ with tabs[1]:
     with c1:
         fecha = st.date_input("Fecha", value=date.today())
         hora = st.time_input("Hora", value=time(10,0))
+        # Hora fin por defecto: +2 horas
+        default_fin = (datetime.combine(date.today(), hora) + timedelta(hours=2)).time()
+        hora_fin = st.time_input("Hora fin", value=default_fin)
         nombre = st.text_input("Nombre de la persona/cliente")
         colonia = st.text_input("Colonia/Zona")
     with c2:
@@ -539,7 +559,7 @@ with tabs[1]:
         next_id = int(dfs["Event_Log"]["ID"].max()) + 1 if len(dfs["Event_Log"]) else 1
         new_row = {
             "ID": next_id,
-            "Fecha": fecha, "Hora": hora,
+            "Fecha": fecha, "Hora": hora, "Hora fin": hora_fin,
             "Nombre": nombre, "Dirección": direccion, "Teléfono": telefono,
             "Colonia/Zona": colonia, "Paquete": paquete,
             "Precio (MXN)": precio, "Add-on Pizza (Sí/No)": "Sí" if add_on else "No",
@@ -560,7 +580,10 @@ with tabs[1]:
         listado["Fecha"] = pd.to_datetime(listado["Fecha"], errors="coerce").dt.date
         h_ser = pd.to_datetime(listado["Hora"], errors="coerce")
         listado["Hora"] = h_ser.dt.time
-        listado.loc[h_ser.isna(), "Hora"] = None  # None compatible con TimeColumn
+        listado.loc[h_ser.isna(), "Hora"] = None  # None compatible
+        hf_ser = pd.to_datetime(listado["Hora fin"], errors="coerce")
+        listado["Hora fin"] = hf_ser.dt.time
+        listado.loc[hf_ser.isna(), "Hora fin"] = None
         listado["Mes"] = pd.Series(listado["Fecha"]).apply(lambda d: MONTH_NAME_MAP.get(d.month, "") if pd.notna(d) else "")
 
         colf1, colf2 = st.columns([2,1])
@@ -573,12 +596,11 @@ with tabs[1]:
         listado = listado.sort_values(["Fecha","Hora"], ascending=True)
 
         listado = listado[[
-            "ID","Fecha","Hora","Estatus","Nombre","Dirección","Teléfono","Colonia/Zona","Paquete",
+            "ID","Fecha","Hora","Hora fin","Estatus","Nombre","Dirección","Teléfono","Colonia/Zona","Paquete",
             "Precio (MXN)","Add-on Pizza (Sí/No)","Retro exterior (Sí/No)","Costo variable (MXN)","Notas"
         ]].copy()
         listado["Seleccionar"] = False
 
-        # IMPORTANTE: aquí NO usamos normalize_df_for_streamlit para preservar types de Fecha/Hora
         edited = st.data_editor(
             listado,
             use_container_width=True,
@@ -586,7 +608,8 @@ with tabs[1]:
             column_config={
                 "Seleccionar": st.column_config.CheckboxColumn("✓"),
                 "Fecha": st.column_config.DateColumn("Fecha"),
-                "Hora": st.column_config.TimeColumn("Hora", step=60)
+                "Hora": st.column_config.TimeColumn("Hora", step=60),
+                "Hora fin": st.column_config.TimeColumn("Hora fin", step=60),
             },
             hide_index=True
         )
@@ -631,6 +654,9 @@ with tabs[1]:
             with ec1:
                 e_fecha = st.date_input("Fecha (edit)", value=pd.to_datetime(row["Fecha"]).date() if pd.notna(row["Fecha"]) else date.today(), key="e_fecha")
                 e_hora = st.time_input("Hora (edit)", value=pd.to_datetime(str(row["Hora"]), errors="coerce").time() if pd.notna(row["Hora"]) else time(10,0), key="e_hora")
+                # fin
+                raw_fin = pd.to_datetime(str(row.get("Hora fin")), errors="coerce")
+                e_hora_fin = st.time_input("Hora fin (edit)", value=(raw_fin.time() if pd.notna(raw_fin) else (datetime.combine(date.today(), e_hora)+timedelta(hours=2)).time()), key="e_hora_fin")
                 e_nombre = st.text_input("Nombre (edit)", value=row.get("Nombre",""), key="e_nombre")
                 e_colonia = st.text_input("Colonia/Zona (edit)", value=row.get("Colonia/Zona",""), key="e_colonia")
             with ec2:
@@ -651,10 +677,10 @@ with tabs[1]:
 
             if st.button("💾 Guardar cambios"):
                 mask = dfs["Event_Log"]["ID"]==eid
-                dfs["Event_Log"].loc[mask, ["Fecha","Hora","Nombre","Dirección","Teléfono","Colonia/Zona","Paquete","Precio (MXN)",
+                dfs["Event_Log"].loc[mask, ["Fecha","Hora","Hora fin","Nombre","Dirección","Teléfono","Colonia/Zona","Paquete","Precio (MXN)",
                                              "Add-on Pizza (Sí/No)","Margen Pizza (MXN)","Retro exterior (Sí/No)",
                                              "Costo variable (MXN)","Notas","Estatus"]] = [
-                    e_fecha, e_hora, e_nombre, e_dir, e_tel, e_colonia, e_paquete, e_precio,
+                    e_fecha, e_hora, e_hora_fin, e_nombre, e_dir, e_tel, e_colonia, e_paquete, e_precio,
                     "Sí" if e_addon else "No", e_margen, "Sí" if e_retro else "No",
                     e_cv, e_notas, e_status
                 ]
@@ -778,4 +804,5 @@ with tabs[5]:
                            file_name=f"{name}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("GAME BUS MTY V.2025")
+st.caption("GAME BUS MTY V.2025 — ahora con Hora fin 😎")
+
