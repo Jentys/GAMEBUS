@@ -1,6 +1,6 @@
 # GAME BUS MTY - Streamlit App
 # FullCalendar + Map Picker + Orden meses + Casillas + Editor
-# FIX v7.6.2 — compat st.rerun + guardado atómico/verificado + formulario de captura
+# FIX v7.7.0 — sin recargas automáticas; persistencia en memoria tras guardar; recarga manual opcional
 
 import streamlit as st
 import pandas as pd
@@ -10,7 +10,7 @@ import json
 import io
 import os
 from urllib.parse import quote_plus
-import tempfile, shutil  # <-- para guardado atómico
+import tempfile, shutil  # guardado atómico
 
 # --- compat rerun (algunas versiones no tienen experimental_rerun) ---
 RERUN = getattr(st, "rerun", lambda: None)
@@ -24,7 +24,7 @@ except Exception:
     HAS_MAP = False
 
 st.set_page_config(page_title="GAME BUS MTY", page_icon="🎮", layout="wide")
-print(">> GAME BUS MTY app - FIX v7.6.2")
+print(">> GAME BUS MTY app - FIX v7.7.0")
 
 DB_PATH = "GameBus_DB.xlsx"
 
@@ -105,6 +105,19 @@ def ensure_eventlog_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["Estatus"] = df["Estatus"].fillna("Pendiente").replace({"": "Pendiente"})
     return df
 
+def reverse_geocode(lat: float, lon: float) -> str:
+    """Reverse geocoding simple via Nominatim (si hay internet)."""
+    try:
+        headers = {"User-Agent": "GAMEBUS-MTY/1.0 (streamlit)"}
+        url = "https://nominatim.openstreetmap.org/reverse"
+        params = {"format": "jsonv2", "lat": lat, "lon": lon, "zoom": 18, "addressdetails": 1}
+        r = requests.get(url, params=params, headers=headers, timeout=8)
+        if r.status_code == 200:
+            return r.json().get("display_name", "")
+    except Exception:
+        pass
+    return ""
+
 def load_db(path=DB_PATH):
     if not os.path.exists(path):
         st.error("No se encontró la base de datos. Sube tu archivo o reinicia la app.")
@@ -117,7 +130,7 @@ def load_db(path=DB_PATH):
     dfs["Event_Log"] = ensure_eventlog_columns(dfs.get("Event_Log", pd.DataFrame()))
     return dfs
 
-# --- Guardado atómico + verificado ---
+# --- Guardado atómico ---
 def save_db_atomic(dfs, path=DB_PATH):
     """Escritura atómica a XLSX y reemplazo seguro: evita archivos truncados."""
     dir_name = os.path.dirname(os.path.abspath(path)) or "."
@@ -135,7 +148,7 @@ def save_db_atomic(dfs, path=DB_PATH):
         except Exception:
             pass
 
-# Alias para no tocar el resto del código:
+# Alias
 save_db = save_db_atomic
 
 # --- Manejo de estado global de la DB ---
@@ -146,9 +159,6 @@ def get_dfs():
 
 def set_dfs(dfs):
     st.session_state["dfs"] = dfs
-
-def reload_from_disk():
-    set_dfs(load_db())
 
 def get_assumption(dfs, var_name, default=0.0):
     df = dfs["Assumptions"]
@@ -499,12 +509,18 @@ with st.sidebar:
     if uploaded:
         with open(DB_PATH, "wb") as f:
             f.write(uploaded.read())
+        # Recarga explícita SOLO cuando el usuario sube un archivo
+        st.session_state["dfs"] = load_db()
         st.success("Base actualizada desde archivo subido.")
-        reload_from_disk()
 
     dfs = get_dfs()
     if st.button("💾 Guardar ahora"):
-        save_db(dfs); st.success("Base guardada.")
+        save_db(dfs)
+        st.success("Base guardada en disco (se mantiene la versión en memoria).")
+
+    if st.button("🔄 Recargar desde disco"):
+        st.session_state["dfs"] = load_db()
+        st.success("Base recargada desde disco.")
 
     if st.button("⬇️ Exportar Excel completo"):
         bio = io.BytesIO()
@@ -545,13 +561,11 @@ with tabs[1]:
     st.subheader("Captura de evento (única fuente de verdad)")
     st.caption("Esto alimenta KPIs (solo cuando marques 'Efectuado') y también la Agenda.")
 
-    # Buffers
     if "direccion_input" not in st.session_state:
         st.session_state["direccion_input"] = ""
     if "last_map_center" not in st.session_state:
         st.session_state["last_map_center"] = [25.6866, -100.3161]  # Monterrey
 
-    # ---------- FORMULARIO DE CAPTURA (submit atómico) ----------
     with st.form("cap_evento", clear_on_submit=True):
         c1,c2,c3 = st.columns(3)
         with c1:
@@ -606,7 +620,6 @@ with tabs[1]:
 
     if submitted:
         try:
-            # 1) construir fila
             next_id = int(dfs["Event_Log"]["ID"].max()) + 1 if len(dfs["Event_Log"]) else 1
             new_row = {
                 "ID": next_id,
@@ -618,34 +631,17 @@ with tabs[1]:
                 "Costo variable (MXN)": costo_var, "Notas": notas,
                 "Estatus": estatus_new
             }
-
-            # 2) agregar en memoria y normalizar
+            # agregar en memoria
             dfs["Event_Log"] = pd.concat([dfs["Event_Log"], pd.DataFrame([new_row])], ignore_index=True)
             dfs["Event_Log"] = ensure_eventlog_columns(dfs["Event_Log"])
+            set_dfs(dfs)  # mantener la versión en memoria
 
-            # 3) guardar atómico y recargar para verificar
+            # guardar a disco (NO recargar desde disco)
             save_db(dfs)
-            set_dfs(dfs)
-            reload_from_disk()
 
-            # 4) verificación: ¿existe el ID recién creado?
-            check = st.session_state["dfs"]["Event_Log"]
-            if (pd.to_numeric(check["ID"], errors="coerce") == next_id).any():
-                st.toast("✅ Evento guardado", icon="✅")
-                st.session_state["direccion_input"] = ""
-                RERUN()
-            else:
-                # Reintento UNA vez (posible lock del SO)
-                save_db(st.session_state["dfs"])
-                reload_from_disk()
-                check2 = st.session_state["dfs"]["Event_Log"]
-                if (pd.to_numeric(check2["ID"], errors="coerce") == next_id).any():
-                    st.toast("✅ Evento guardado", icon="✅")
-                    st.session_state["direccion_input"] = ""
-                    RERUN()
-                else:
-                    st.error("No se pudo confirmar el guardado del evento (verifica permisos del archivo).")
-
+            st.toast("✅ Evento guardado (memoria + disco).", icon="✅")
+            st.session_state["direccion_input"] = ""
+            RERUN()
         except Exception as e:
             st.error(f"No se pudo guardar el evento: {e}")
 
@@ -693,24 +689,27 @@ with tabs[1]:
             if st.button("✅ Marcar como Efectuado"):
                 if sel_ids:
                     dfs["Event_Log"].loc[dfs["Event_Log"]["ID"].isin(sel_ids), "Estatus"] = "Efectuado"
-                    save_db(dfs); set_dfs(dfs); st.success("Marcado como Efectuado.")
-                    reload_from_disk(); RERUN()
+                    set_dfs(dfs); save_db(dfs)
+                    st.success("Marcado como Efectuado (memoria + disco).")
+                    RERUN()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac2:
             if st.button("⏳ Marcar como Pendiente"):
                 if sel_ids:
                     dfs["Event_Log"].loc[dfs["Event_Log"]["ID"].isin(sel_ids), "Estatus"] = "Pendiente"
-                    save_db(dfs); set_dfs(dfs); st.success("Marcado como Pendiente.")
-                    reload_from_disk(); RERUN()
+                    set_dfs(dfs); save_db(dfs)
+                    st.success("Marcado como Pendiente (memoria + disco).")
+                    RERUN()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac3:
             if st.button("🗑️ Borrar seleccionados"):
                 if sel_ids:
                     dfs["Event_Log"] = dfs["Event_Log"][~dfs["Event_Log"]["ID"].isin(sel_ids)].reset_index(drop=True)
-                    save_db(dfs); set_dfs(dfs); st.success("Evento(s) borrado(s).")
-                    reload_from_disk(); RERUN()
+                    set_dfs(dfs); save_db(dfs)
+                    st.success("Evento(s) borrado(s) (memoria + disco).")
+                    RERUN()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac4:
@@ -758,12 +757,12 @@ with tabs[1]:
                     "Sí" if e_addon else "No", e_margen, "Sí" if e_retro else "No",
                     e_cv, e_notas, e_status
                 ]
-                save_db(dfs); set_dfs(dfs)
-                st.success("Cambios guardados.")
+                set_dfs(dfs); save_db(dfs)
+                st.success("Cambios guardados (memoria + disco).")
                 del st.session_state["edit_id"]
-                reload_from_disk(); RERUN()
+                RERUN()
 
-        # CSV solo lee la vista tipada; NO toca la base
+        # CSV se arma desde la vista en memoria (no recarga disco)
         ev_csv = listado.drop(columns=["Seleccionar"], errors="ignore").to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Descargar CSV de eventos", data=ev_csv, file_name="eventos.csv", mime="text/csv")
     else:
@@ -816,8 +815,8 @@ with tabs[3]:
                 else:
                     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
                 dfs["Ads"] = df
-                save_db(dfs); set_dfs(dfs)
-                st.success("Ads actualizado.")
+                set_dfs(dfs); save_db(dfs)
+                st.success("Ads actualizado (memoria + disco).")
         with mcol2:
             df = dfs["Ads"].copy()
             if not df.empty:
@@ -844,8 +843,8 @@ with tabs[3]:
                 else:
                     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
                 dfs["Funnel"] = df
-                save_db(dfs); set_dfs(dfs)
-                st.success("Funnel actualizado.")
+                set_dfs(dfs); save_db(dfs)
+                st.success("Funnel actualizado (memoria + disco).")
         with fcol2:
             df = dfs["Funnel"].copy()
             if not df.empty:
@@ -863,8 +862,8 @@ with tabs[4]:
     edited = st.data_editor(assum, use_container_width=True, num_rows="dynamic")
     if st.button("💾 Guardar Assumptions"):
         dfs["Assumptions"] = edited
-        save_db(dfs); set_dfs(dfs)
-        st.success("Assumptions guardado.")
+        set_dfs(dfs); save_db(dfs)
+        st.success("Assumptions guardado (memoria + disco).")
 
 # --- Datos (ver/exportar) ---
 with tabs[5]:
@@ -884,4 +883,4 @@ with tabs[5]:
                            file_name=f"{name}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("GAME BUS MTY V.2025 — v7.6.2 (guardado atómico + verificación + submit atómico)")
+st.caption("GAME BUS MTY V.2025 — v7.7.0 (sin recargas automáticas; memoria primero; recarga manual opcional)")
