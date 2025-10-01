@@ -1,6 +1,6 @@
 # GAME BUS MTY - Streamlit App
 # FullCalendar + Map Picker + Orden meses + Casillas + Editor
-# FIX v7.6 — formulario de captura (submit atómico), guardado robusto y reload; IDs estables
+# FIX v7.6.1 — compat st.rerun, formulario de captura (submit atómico), guardado robusto, IDs estables
 
 import streamlit as st
 import pandas as pd
@@ -11,6 +11,9 @@ import io
 import os
 from urllib.parse import quote_plus
 
+# --- compat rerun (algunas versiones no tienen experimental_rerun) ---
+RERUN = getattr(st, "rerun", lambda: None)
+
 # --- mapa opcional ---
 HAS_MAP = True
 try:
@@ -20,7 +23,7 @@ except Exception:
     HAS_MAP = False
 
 st.set_page_config(page_title="GAME BUS MTY", page_icon="🎮", layout="wide")
-print(">> GAME BUS MTY app - FIX v7.6")
+print(">> GAME BUS MTY app - FIX v7.6.1")
 
 DB_PATH = "GameBus_DB.xlsx"
 
@@ -84,13 +87,13 @@ def ensure_eventlog_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["ID"] = range(1, len(df)+1)
     else:
         max_id = int((df["ID"].max() or 0))
-        # rellenar NaN con nuevos IDs
+        # NaN -> nuevos IDs
         nan_mask = df["ID"].isna()
         if nan_mask.any():
             new_ids = list(range(max_id+1, max_id+1+nan_mask.sum()))
             df.loc[nan_mask, "ID"] = new_ids
             max_id += nan_mask.sum()
-        # duplicados: reasignar solo a los duplicados (excepto el primero)
+        # duplicados -> reasignar solo duplicados
         dups = df["ID"].duplicated(keep="first")
         if dups.any():
             for idx in np.where(dups)[0]:
@@ -599,10 +602,9 @@ with tabs[1]:
             save_db(dfs)
             set_dfs(dfs)
             st.toast("✅ Evento guardado", icon="✅")
-            # limpiar dirección temporal y recargar para normalizar tipos
             st.session_state["direccion_input"] = ""
             reload_from_disk()
-            st.experimental_rerun()
+            RERUN()
         except Exception as e:
             st.error(f"No se pudo guardar el evento: {e}")
 
@@ -651,7 +653,7 @@ with tabs[1]:
                 if sel_ids:
                     dfs["Event_Log"].loc[dfs["Event_Log"]["ID"].isin(sel_ids), "Estatus"] = "Efectuado"
                     save_db(dfs); set_dfs(dfs); st.success("Marcado como Efectuado.")
-                    reload_from_disk(); st.experimental_rerun()
+                    reload_from_disk(); RERUN()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac2:
@@ -659,7 +661,7 @@ with tabs[1]:
                 if sel_ids:
                     dfs["Event_Log"].loc[dfs["Event_Log"]["ID"].isin(sel_ids), "Estatus"] = "Pendiente"
                     save_db(dfs); set_dfs(dfs); st.success("Marcado como Pendiente.")
-                    reload_from_disk(); st.experimental_rerun()
+                    reload_from_disk(); RERUN()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac3:
@@ -667,7 +669,7 @@ with tabs[1]:
                 if sel_ids:
                     dfs["Event_Log"] = dfs["Event_Log"][~dfs["Event_Log"]["ID"].isin(sel_ids)].reset_index(drop=True)
                     save_db(dfs); set_dfs(dfs); st.success("Evento(s) borrado(s).")
-                    reload_from_disk(); st.experimental_rerun()
+                    reload_from_disk(); RERUN()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac4:
@@ -718,7 +720,7 @@ with tabs[1]:
                 save_db(dfs); set_dfs(dfs)
                 st.success("Cambios guardados.")
                 del st.session_state["edit_id"]
-                reload_from_disk(); st.experimental_rerun()
+                reload_from_disk(); RERUN()
 
         # CSV solo lee la vista tipada; NO toca la base
         ev_csv = listado.drop(columns=["Seleccionar"], errors="ignore").to_csv(index=False).encode("utf-8")
@@ -841,4 +843,4 @@ with tabs[5]:
                            file_name=f"{name}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("GAME BUS MTY V.2025 — v7.6 (form submit atómico + guardado robusto)")
+st.caption("GAME BUS MTY V.2025 — v7.6.1 (rerun compat + submit atómico)")
