@@ -1,6 +1,6 @@
 # GAME BUS MTY - Streamlit App
 # FullCalendar + Map Picker + Orden meses + Casillas + Editor
-# FIX v7.5 — dfs en session_state (consistencia), reload tras guardar, parsers robustos, IDs estables
+# FIX v7.4 — parsers robustos de Fecha/Hora, rerun al guardar y IDs estables (no se borran filas)
 
 import streamlit as st
 import pandas as pd
@@ -19,7 +19,7 @@ try:
 except Exception:
     HAS_MAP = False
 
-print(">> GAME BUS MTY app - FIX v7.5")
+print(">> GAME BUS MTY app - FIX v7.4")
 
 st.set_page_config(page_title="GAME BUS MTY", page_icon="🎮", layout="wide")
 
@@ -79,22 +79,23 @@ def ensure_eventlog_columns(df: pd.DataFrame) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
 
-    # IDs estables (no reordenar ni reenumerar todo)
-    df["ID"] = pd.to_numeric(df["ID"], errors="coerce")
+    # IDs estables: no reordenar ni re-enumerar todo el DF.
     if df["ID"].isna().all():
         df["ID"] = range(1, len(df)+1)
     else:
+        # completar NaN con nuevos IDs
+        df["ID"] = pd.to_numeric(df["ID"], errors="coerce")
         max_id = int((df["ID"].max() or 0))
-        # rellenar NaN con nuevos IDs
         nan_mask = df["ID"].isna()
         if nan_mask.any():
             new_ids = list(range(max_id+1, max_id+1+nan_mask.sum()))
             df.loc[nan_mask, "ID"] = new_ids
             max_id += nan_mask.sum()
-        # duplicados: reasignar solo a los duplicados (excepto el primero)
+        # resolver duplicados asignando IDs nuevos solo a los duplicados (excepto el primero)
         dups = df["ID"].duplicated(keep="first")
         if dups.any():
-            for idx in np.where(dups)[0]:
+            dup_idx = np.where(dups)[0]
+            for i, idx in enumerate(dup_idx, start=1):
                 max_id += 1
                 df.iat[idx, df.columns.get_loc("ID")] = max_id
 
@@ -118,17 +119,6 @@ def save_db(dfs, path=DB_PATH):
     with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
         for name, df in dfs.items():
             df.to_excel(writer, index=False, sheet_name=name)
-
-def get_dfs():
-    if "dfs" not in st.session_state:
-        st.session_state["dfs"] = load_db()
-    return st.session_state["dfs"]
-
-def set_dfs(dfs):
-    st.session_state["dfs"] = dfs
-
-def reload_from_disk():
-    set_dfs(load_db())
 
 def get_assumption(dfs, var_name, default=0.0):
     df = dfs["Assumptions"]
@@ -493,9 +483,8 @@ with st.sidebar:
         with open(DB_PATH, "wb") as f:
             f.write(uploaded.read())
         st.success("Base actualizada desde archivo subido.")
-        reload_from_disk()
 
-    dfs = get_dfs()
+    dfs = load_db()
     if st.button("💾 Guardar ahora"):
         save_db(dfs); st.success("Base guardada.")
 
@@ -512,7 +501,6 @@ tabs = st.tabs(["📊 Dashboard","📒 Eventos (captura)","🗓️ Agenda (calen
 
 # --- Dashboard ---
 with tabs[0]:
-    dfs = get_dfs()
     st.subheader("KPIs del año (hasta mes actual, solo Efectuados)")
     monthly = compute_monthly(dfs)
     monthly["Mes"] = pd.Categorical(monthly["Mes"], categories=SPANISH_MONTHS, ordered=True)
@@ -534,7 +522,6 @@ with tabs[0]:
 
 # --- Eventos (captura) ---
 with tabs[1]:
-    dfs = get_dfs()
     st.subheader("Captura de evento (única fuente de verdad)")
     st.caption("Esto alimenta KPIs (solo cuando marques 'Efectuado') y también la Agenda.")
 
@@ -592,6 +579,7 @@ with tabs[1]:
         estatus_new = st.selectbox("Estatus del evento", ["Pendiente","Efectuado"], index=0)
 
     if st.button("➕ Guardar evento"):
+        # ID siguiente, estable:
         next_id = int(dfs["Event_Log"]["ID"].max()) + 1 if len(dfs["Event_Log"]) else 1
         new_row = {
             "ID": next_id,
@@ -603,21 +591,17 @@ with tabs[1]:
             "Costo variable (MXN)": costo_var, "Notas": notas,
             "Estatus": estatus_new
         }
-        # Actualiza session + disco
         dfs["Event_Log"] = pd.concat([dfs["Event_Log"], pd.DataFrame([new_row])], ignore_index=True)
         dfs["Event_Log"] = ensure_eventlog_columns(dfs["Event_Log"])
         save_db(dfs)
-        set_dfs(dfs)
         st.success("Evento guardado.")
         st.session_state["direccion_input"] = ""
-        # Recarga desde disco para evitar cualquier incoherencia de tipos
-        reload_from_disk()
-        st.rerun()
+        st.rerun()  # <<< refresca UI con datos ya persistidos
 
     st.markdown("### Historial / Lista de eventos (con casillas)")
-    dfs = get_dfs()
     listado = dfs["Event_Log"].copy()
     if not listado.empty:
+        # Tipos sólidos para el editor
         listado["Fecha"]    = listado["Fecha"].apply(parse_date_any)
         listado["Hora"]     = listado["Hora"].apply(parse_time_any)
         listado["Hora fin"] = listado["Hora fin"].apply(parse_time_any)
@@ -658,24 +642,24 @@ with tabs[1]:
             if st.button("✅ Marcar como Efectuado"):
                 if sel_ids:
                     dfs["Event_Log"].loc[dfs["Event_Log"]["ID"].isin(sel_ids), "Estatus"] = "Efectuado"
-                    save_db(dfs); set_dfs(dfs); st.success("Marcado como Efectuado.")
-                    reload_from_disk(); st.rerun()
+                    save_db(dfs); st.success("Marcado como Efectuado.")
+                    st.rerun()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac2:
             if st.button("⏳ Marcar como Pendiente"):
                 if sel_ids:
                     dfs["Event_Log"].loc[dfs["Event_Log"]["ID"].isin(sel_ids), "Estatus"] = "Pendiente"
-                    save_db(dfs); set_dfs(dfs); st.success("Marcado como Pendiente.")
-                    reload_from_disk(); st.rerun()
+                    save_db(dfs); st.success("Marcado como Pendiente.")
+                    st.rerun()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac3:
             if st.button("🗑️ Borrar seleccionados"):
                 if sel_ids:
                     dfs["Event_Log"] = dfs["Event_Log"][~dfs["Event_Log"]["ID"].isin(sel_ids)].reset_index(drop=True)
-                    save_db(dfs); set_dfs(dfs); st.success("Evento(s) borrado(s).")
-                    reload_from_disk(); st.rerun()
+                    save_db(dfs); st.success("Evento(s) borrado(s).")
+                    st.rerun()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac4:
@@ -723,10 +707,10 @@ with tabs[1]:
                     "Sí" if e_addon else "No", e_margen, "Sí" if e_retro else "No",
                     e_cv, e_notas, e_status
                 ]
-                save_db(dfs); set_dfs(dfs)
+                save_db(dfs)
                 st.success("Cambios guardados.")
                 del st.session_state["edit_id"]
-                reload_from_disk(); st.rerun()
+                st.rerun()
 
         # CSV solo lee la vista tipada; NO toca la base
         ev_csv = listado.drop(columns=["Seleccionar"], errors="ignore").to_csv(index=False).encode("utf-8")
@@ -736,7 +720,6 @@ with tabs[1]:
 
 # --- Agenda (FullCalendar) ---
 with tabs[2]:
-    dfs = get_dfs()
     st.subheader("Agenda (estilo Google Calendar)")
     st.caption("Se construye desde 📒 Eventos. Click para ver datos y mapa.")
     ev = dfs["Event_Log"].copy()
@@ -759,7 +742,6 @@ with tabs[2]:
 
 # --- Ads & Funnel ---
 with tabs[3]:
-    dfs = get_dfs()
     st.subheader("Ads & Funnel")
     st.caption("Captura mensual y métricas derivadas.")
     with st.expander("📣 Ads", True):
@@ -781,7 +763,7 @@ with tabs[3]:
                 else:
                     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
                 dfs["Ads"] = df
-                save_db(dfs); set_dfs(dfs)
+                save_db(dfs)
                 st.success("Ads actualizado.")
         with mcol2:
             df = dfs["Ads"].copy()
@@ -809,7 +791,7 @@ with tabs[3]:
                 else:
                     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
                 dfs["Funnel"] = df
-                save_db(dfs); set_dfs(dfs)
+                save_db(dfs)
                 st.success("Funnel actualizado.")
         with fcol2:
             df = dfs["Funnel"].copy()
@@ -821,19 +803,17 @@ with tabs[3]:
 
 # --- Configuración ---
 with tabs[4]:
-    dfs = get_dfs()
     st.subheader("Assumptions (editar)")
     assum = dfs["Assumptions"].copy()
     st.caption("Edita los valores y presiona Guardar para aplicar.")
     edited = st.data_editor(assum, use_container_width=True, num_rows="dynamic")
     if st.button("💾 Guardar Assumptions"):
         dfs["Assumptions"] = edited
-        save_db(dfs); set_dfs(dfs)
+        save_db(dfs)
         st.success("Assumptions guardado.")
 
 # --- Datos (ver/exportar) ---
 with tabs[5]:
-    dfs = get_dfs()
     st.subheader("Hojas de la base de datos")
     for name in ["Monthly","Event_Log","Ads","Funnel","Summary"]:
         st.markdown(f"#### {name}")
@@ -849,4 +829,4 @@ with tabs[5]:
                            file_name=f"{name}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("GAME BUS MTY V.2025 — v7.5 (session_state DFS + reload inmediato)")
+st.caption("GAME BUS MTY V.2025 — v7.4 (IDs estables, parsers robustos y refresh inmediato)")
