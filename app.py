@@ -1,6 +1,6 @@
 # GAME BUS MTY - Streamlit App
 # FullCalendar + Map Picker + Orden meses + Casillas + Editor
-# FIX v7.6.1 — compat st.rerun, formulario de captura (submit atómico), guardado robusto, IDs estables
+# FIX v7.6.2 — compat st.rerun + guardado atómico/verificado + formulario de captura
 
 import streamlit as st
 import pandas as pd
@@ -10,6 +10,7 @@ import json
 import io
 import os
 from urllib.parse import quote_plus
+import tempfile, shutil  # <-- para guardado atómico
 
 # --- compat rerun (algunas versiones no tienen experimental_rerun) ---
 RERUN = getattr(st, "rerun", lambda: None)
@@ -23,7 +24,7 @@ except Exception:
     HAS_MAP = False
 
 st.set_page_config(page_title="GAME BUS MTY", page_icon="🎮", layout="wide")
-print(">> GAME BUS MTY app - FIX v7.6.1")
+print(">> GAME BUS MTY app - FIX v7.6.2")
 
 DB_PATH = "GameBus_DB.xlsx"
 
@@ -116,10 +117,26 @@ def load_db(path=DB_PATH):
     dfs["Event_Log"] = ensure_eventlog_columns(dfs.get("Event_Log", pd.DataFrame()))
     return dfs
 
-def save_db(dfs, path=DB_PATH):
-    with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
-        for name, df in dfs.items():
-            df.to_excel(writer, index=False, sheet_name=name)
+# --- Guardado atómico + verificado ---
+def save_db_atomic(dfs, path=DB_PATH):
+    """Escritura atómica a XLSX y reemplazo seguro: evita archivos truncados."""
+    dir_name = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix="gamebus_", suffix=".xlsx", dir=dir_name)
+    os.close(fd)
+    try:
+        with pd.ExcelWriter(tmp_path, engine="xlsxwriter") as writer:
+            for name, df in dfs.items():
+                df.to_excel(writer, index=False, sheet_name=name)
+        shutil.move(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+# Alias para no tocar el resto del código:
+save_db = save_db_atomic
 
 # --- Manejo de estado global de la DB ---
 def get_dfs():
@@ -554,7 +571,10 @@ with tabs[1]:
                         lat = out["last_clicked"]["lat"]; lon = out["last_clicked"]["lng"]
                         st.session_state["last_map_center"] = [lat, lon]
                         st.info(f"Coordenadas: {lat:.6f}, {lon:.6f}")
-                        addr = reverse_geocode(lat, lon)
+                        try:
+                            addr = reverse_geocode(lat, lon)
+                        except Exception:
+                            addr = ""
                         if addr:
                             st.session_state["direccion_input"] = addr
                             st.success("Dirección autollenada desde el mapa ✅")
@@ -586,6 +606,7 @@ with tabs[1]:
 
     if submitted:
         try:
+            # 1) construir fila
             next_id = int(dfs["Event_Log"]["ID"].max()) + 1 if len(dfs["Event_Log"]) else 1
             new_row = {
                 "ID": next_id,
@@ -597,14 +618,34 @@ with tabs[1]:
                 "Costo variable (MXN)": costo_var, "Notas": notas,
                 "Estatus": estatus_new
             }
+
+            # 2) agregar en memoria y normalizar
             dfs["Event_Log"] = pd.concat([dfs["Event_Log"], pd.DataFrame([new_row])], ignore_index=True)
             dfs["Event_Log"] = ensure_eventlog_columns(dfs["Event_Log"])
+
+            # 3) guardar atómico y recargar para verificar
             save_db(dfs)
             set_dfs(dfs)
-            st.toast("✅ Evento guardado", icon="✅")
-            st.session_state["direccion_input"] = ""
             reload_from_disk()
-            RERUN()
+
+            # 4) verificación: ¿existe el ID recién creado?
+            check = st.session_state["dfs"]["Event_Log"]
+            if (pd.to_numeric(check["ID"], errors="coerce") == next_id).any():
+                st.toast("✅ Evento guardado", icon="✅")
+                st.session_state["direccion_input"] = ""
+                RERUN()
+            else:
+                # Reintento UNA vez (posible lock del SO)
+                save_db(st.session_state["dfs"])
+                reload_from_disk()
+                check2 = st.session_state["dfs"]["Event_Log"]
+                if (pd.to_numeric(check2["ID"], errors="coerce") == next_id).any():
+                    st.toast("✅ Evento guardado", icon="✅")
+                    st.session_state["direccion_input"] = ""
+                    RERUN()
+                else:
+                    st.error("No se pudo confirmar el guardado del evento (verifica permisos del archivo).")
+
         except Exception as e:
             st.error(f"No se pudo guardar el evento: {e}")
 
@@ -843,4 +884,4 @@ with tabs[5]:
                            file_name=f"{name}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("GAME BUS MTY V.2025 — v7.6.1 (rerun compat + submit atómico)")
+st.caption("GAME BUS MTY V.2025 — v7.6.2 (guardado atómico + verificación + submit atómico)")
