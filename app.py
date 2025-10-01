@@ -1,6 +1,6 @@
 # GAME BUS MTY - Streamlit App
-# FullCalendar + Map Picker (sin key conflict) + Orden meses + Casillas + Editor
-# FIX v7.3 — agrega "Hora fin" (finalización) en captura/edición/lista/calendario/ICS
+# FullCalendar + Map Picker + Orden meses + Casillas + Editor
+# FIX v7.5 — dfs en session_state (consistencia), reload tras guardar, parsers robustos, IDs estables
 
 import streamlit as st
 import pandas as pd
@@ -19,7 +19,7 @@ try:
 except Exception:
     HAS_MAP = False
 
-print(">> GAME BUS MTY app - FIX v7.3 (Hora fin)")
+print(">> GAME BUS MTY app - FIX v7.5")
 
 st.set_page_config(page_title="GAME BUS MTY", page_icon="🎮", layout="wide")
 
@@ -31,7 +31,6 @@ APPLY_FIXED_FROM_MONTH = 10  # Octubre
 
 # ---------- Helpers ----------
 def normalize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
-    """Para tablas de solo lectura (st.dataframe). Convierte objetos fecha/hora a formatos seguros."""
     if df is None or df.empty:
         return df
     out = df.copy()
@@ -40,7 +39,6 @@ def normalize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
         if s.dtype == "O" and s.apply(lambda x: isinstance(x, (pd.Timestamp, datetime, date, np.datetime64))).any():
             out[col] = pd.to_datetime(s, errors="coerce")
         elif s.dtype == "O" and s.apply(lambda x: isinstance(x, (time,))).any():
-            # Para data_editor usamos el df limpio; aquí lo mostramos como texto para evitar pyarrow
             out[col] = s.astype(str)
     return out
 
@@ -50,6 +48,27 @@ def month_to_num(mes_str: str) -> int:
     except Exception:
         return 0
 
+# --- Parsers robustos para editor/agenda ---
+def parse_date_any(x):
+    if x is None or (isinstance(x, str) and not x.strip()):
+        return None
+    try:
+        d = pd.to_datetime(x, errors="coerce")
+        return d.date() if pd.notna(d) else None
+    except Exception:
+        return None
+
+def parse_time_any(x):
+    if x is None or (isinstance(x, str) and not x.strip()):
+        return None
+    if isinstance(x, time):
+        return x
+    try:
+        t = pd.to_datetime(str(x), errors="coerce")
+        return t.time() if pd.notna(t) else None
+    except Exception:
+        return None
+
 def ensure_eventlog_columns(df: pd.DataFrame) -> pd.DataFrame:
     need_cols = [
         "ID","Fecha","Hora","Hora fin","Nombre","Dirección","Teléfono",
@@ -58,16 +77,28 @@ def ensure_eventlog_columns(df: pd.DataFrame) -> pd.DataFrame:
     ]
     for c in need_cols:
         if c not in df.columns:
-            if c == "ID":
-                df["ID"] = range(1, len(df) + 1)
-            elif c == "Estatus":
-                df["Estatus"] = "Pendiente"
-            else:
-                df[c] = np.nan
-    if df["ID"].isna().any() or df["ID"].duplicated().any():
-        df = df.sort_values(["Fecha","Hora"], na_position="last").reset_index(drop=True)
-        df["ID"] = range(1, len(df) + 1)
-    df["ID"] = pd.to_numeric(df["ID"], errors="coerce").fillna(0).astype(int)
+            df[c] = np.nan
+
+    # IDs estables (no reordenar ni reenumerar todo)
+    df["ID"] = pd.to_numeric(df["ID"], errors="coerce")
+    if df["ID"].isna().all():
+        df["ID"] = range(1, len(df)+1)
+    else:
+        max_id = int((df["ID"].max() or 0))
+        # rellenar NaN con nuevos IDs
+        nan_mask = df["ID"].isna()
+        if nan_mask.any():
+            new_ids = list(range(max_id+1, max_id+1+nan_mask.sum()))
+            df.loc[nan_mask, "ID"] = new_ids
+            max_id += nan_mask.sum()
+        # duplicados: reasignar solo a los duplicados (excepto el primero)
+        dups = df["ID"].duplicated(keep="first")
+        if dups.any():
+            for idx in np.where(dups)[0]:
+                max_id += 1
+                df.iat[idx, df.columns.get_loc("ID")] = max_id
+
+    df["ID"] = df["ID"].astype(int)
     df["Estatus"] = df["Estatus"].fillna("Pendiente").replace({"": "Pendiente"})
     return df
 
@@ -87,6 +118,17 @@ def save_db(dfs, path=DB_PATH):
     with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
         for name, df in dfs.items():
             df.to_excel(writer, index=False, sheet_name=name)
+
+def get_dfs():
+    if "dfs" not in st.session_state:
+        st.session_state["dfs"] = load_db()
+    return st.session_state["dfs"]
+
+def set_dfs(dfs):
+    st.session_state["dfs"] = dfs
+
+def reload_from_disk():
+    set_dfs(load_db())
 
 def get_assumption(dfs, var_name, default=0.0):
     df = dfs["Assumptions"]
@@ -116,7 +158,6 @@ def compute_funnel_metrics(row):
     return row
 
 def _combine_dt(fecha_val, hora_val, fallback="10:00"):
-    """Combina fecha + hora a datetime; hora puede venir None/NaN/str/time."""
     f = pd.to_datetime(fecha_val, errors="coerce")
     if pd.isna(f):
         return None
@@ -134,9 +175,8 @@ def to_ics(df_events):
     lines = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//GAME BUS MTY//Agenda//ES"]
     for _, r in df_events.iterrows():
         dtstart = _combine_dt(r.get("Fecha"), r.get("Hora"), "10:00")
-        if not dtstart: 
+        if not dtstart:
             continue
-        # DTEND: usa Hora fin o +2h
         dtend = _combine_dt(r.get("Fecha"), r.get("Hora fin"), dtstart.strftime("%H:%M"))
         if not dtend or dtend <= dtstart:
             dtend = dtstart + timedelta(hours=2)
@@ -405,11 +445,9 @@ def events_to_fullcalendar(ev_df):
         d = row["Fecha"]
         if pd.isna(d):
             return None, None
-        # start
         start_dt = _combine_dt(d, row.get("Hora"), "10:00")
         if not start_dt:
             return None, None
-        # end: Hora fin o +2h
         end_dt = _combine_dt(d, row.get("Hora fin"), start_dt.strftime("%H:%M"))
         if (not end_dt) or end_dt <= start_dt:
             end_dt = start_dt + timedelta(hours=2)
@@ -421,7 +459,6 @@ def events_to_fullcalendar(ev_df):
         if not start:
             continue
         title = r.get("Nombre") or r.get("Colonia/Zona") or "Evento"
-        # color
         def color_for(paquete, estatus):
             p = str(paquete or "").strip().lower()
             if str(estatus).lower() == "pendiente":
@@ -456,8 +493,9 @@ with st.sidebar:
         with open(DB_PATH, "wb") as f:
             f.write(uploaded.read())
         st.success("Base actualizada desde archivo subido.")
+        reload_from_disk()
 
-    dfs = load_db()
+    dfs = get_dfs()
     if st.button("💾 Guardar ahora"):
         save_db(dfs); st.success("Base guardada.")
 
@@ -474,6 +512,7 @@ tabs = st.tabs(["📊 Dashboard","📒 Eventos (captura)","🗓️ Agenda (calen
 
 # --- Dashboard ---
 with tabs[0]:
+    dfs = get_dfs()
     st.subheader("KPIs del año (hasta mes actual, solo Efectuados)")
     monthly = compute_monthly(dfs)
     monthly["Mes"] = pd.Categorical(monthly["Mes"], categories=SPANISH_MONTHS, ordered=True)
@@ -495,6 +534,7 @@ with tabs[0]:
 
 # --- Eventos (captura) ---
 with tabs[1]:
+    dfs = get_dfs()
     st.subheader("Captura de evento (única fuente de verdad)")
     st.caption("Esto alimenta KPIs (solo cuando marques 'Efectuado') y también la Agenda.")
 
@@ -508,13 +548,11 @@ with tabs[1]:
     with c1:
         fecha = st.date_input("Fecha", value=date.today())
         hora = st.time_input("Hora", value=time(10,0))
-        # Hora fin por defecto: +2 horas
         default_fin = (datetime.combine(date.today(), hora) + timedelta(hours=2)).time()
         hora_fin = st.time_input("Hora fin", value=default_fin)
         nombre = st.text_input("Nombre de la persona/cliente")
         colonia = st.text_input("Colonia/Zona")
     with c2:
-        # 1) MAPA primero (para escribir en session_state antes del text_input)
         with st.expander("📍 Seleccionar en mapa (click para autollenar Dirección)", expanded=False):
             if HAS_MAP:
                 m = folium.Map(location=st.session_state["last_map_center"], zoom_start=11, control_scale=True)
@@ -534,11 +572,9 @@ with tabs[1]:
             else:
                 st.warning("Para usar el selector de mapa instala: pip install streamlit-folium folium requests")
 
-        # 2) TEXT INPUT con value de session_state (sin key conflictivo)
         direccion_default = st.session_state.get("direccion_input", "")
         direccion = st.text_input("Dirección", value=direccion_default)
 
-        # Link a Google Maps
         if direccion.strip():
             maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(direccion.strip())}"
             st.markdown(f"[🗺️ Abrir en Google Maps]({maps_url})", unsafe_allow_html=True)
@@ -567,24 +603,25 @@ with tabs[1]:
             "Costo variable (MXN)": costo_var, "Notas": notas,
             "Estatus": estatus_new
         }
+        # Actualiza session + disco
         dfs["Event_Log"] = pd.concat([dfs["Event_Log"], pd.DataFrame([new_row])], ignore_index=True)
         dfs["Event_Log"] = ensure_eventlog_columns(dfs["Event_Log"])
         save_db(dfs)
+        set_dfs(dfs)
         st.success("Evento guardado.")
         st.session_state["direccion_input"] = ""
+        # Recarga desde disco para evitar cualquier incoherencia de tipos
+        reload_from_disk()
+        st.rerun()
 
     st.markdown("### Historial / Lista de eventos (con casillas)")
+    dfs = get_dfs()
     listado = dfs["Event_Log"].copy()
     if not listado.empty:
-        # Preparar tipos para data_editor (evita error de compatibilidad)
-        listado["Fecha"] = pd.to_datetime(listado["Fecha"], errors="coerce").dt.date
-        h_ser = pd.to_datetime(listado["Hora"], errors="coerce")
-        listado["Hora"] = h_ser.dt.time
-        listado.loc[h_ser.isna(), "Hora"] = None  # None compatible
-        hf_ser = pd.to_datetime(listado["Hora fin"], errors="coerce")
-        listado["Hora fin"] = hf_ser.dt.time
-        listado.loc[hf_ser.isna(), "Hora fin"] = None
-        listado["Mes"] = pd.Series(listado["Fecha"]).apply(lambda d: MONTH_NAME_MAP.get(d.month, "") if pd.notna(d) else "")
+        listado["Fecha"]    = listado["Fecha"].apply(parse_date_any)
+        listado["Hora"]     = listado["Hora"].apply(parse_time_any)
+        listado["Hora fin"] = listado["Hora fin"].apply(parse_time_any)
+        listado["Mes"] = pd.Series(listado["Fecha"]).apply(lambda d: MONTH_NAME_MAP.get(d.month, "") if d else "")
 
         colf1, colf2 = st.columns([2,1])
         with colf1:
@@ -593,7 +630,7 @@ with tabs[1]:
             est_filter = st.multiselect("Estatus", ["Pendiente","Efectuado"], default=["Pendiente","Efectuado"])
 
         listado = listado[listado["Mes"].isin(month_filter) & listado["Estatus"].isin(est_filter)]
-        listado = listado.sort_values(["Fecha","Hora"], ascending=True)
+        listado = listado.sort_values(["Fecha","Hora"], ascending=True, na_position="last")
 
         listado = listado[[
             "ID","Fecha","Hora","Hora fin","Estatus","Nombre","Dirección","Teléfono","Colonia/Zona","Paquete",
@@ -621,21 +658,24 @@ with tabs[1]:
             if st.button("✅ Marcar como Efectuado"):
                 if sel_ids:
                     dfs["Event_Log"].loc[dfs["Event_Log"]["ID"].isin(sel_ids), "Estatus"] = "Efectuado"
-                    save_db(dfs); st.success("Marcado como Efectuado.")
+                    save_db(dfs); set_dfs(dfs); st.success("Marcado como Efectuado.")
+                    reload_from_disk(); st.rerun()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac2:
             if st.button("⏳ Marcar como Pendiente"):
                 if sel_ids:
                     dfs["Event_Log"].loc[dfs["Event_Log"]["ID"].isin(sel_ids), "Estatus"] = "Pendiente"
-                    save_db(dfs); st.success("Marcado como Pendiente.")
+                    save_db(dfs); set_dfs(dfs); st.success("Marcado como Pendiente.")
+                    reload_from_disk(); st.rerun()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac3:
             if st.button("🗑️ Borrar seleccionados"):
                 if sel_ids:
                     dfs["Event_Log"] = dfs["Event_Log"][~dfs["Event_Log"]["ID"].isin(sel_ids)].reset_index(drop=True)
-                    save_db(dfs); st.success("Evento(s) borrado(s).")
+                    save_db(dfs); set_dfs(dfs); st.success("Evento(s) borrado(s).")
+                    reload_from_disk(); st.rerun()
                 else:
                     st.warning("Selecciona al menos un evento.")
         with ac4:
@@ -652,11 +692,10 @@ with tabs[1]:
             row = dfs["Event_Log"].loc[dfs["Event_Log"]["ID"]==eid].iloc[0]
             ec1, ec2, ec3 = st.columns(3)
             with ec1:
-                e_fecha = st.date_input("Fecha (edit)", value=pd.to_datetime(row["Fecha"]).date() if pd.notna(row["Fecha"]) else date.today(), key="e_fecha")
-                e_hora = st.time_input("Hora (edit)", value=pd.to_datetime(str(row["Hora"]), errors="coerce").time() if pd.notna(row["Hora"]) else time(10,0), key="e_hora")
-                # fin
-                raw_fin = pd.to_datetime(str(row.get("Hora fin")), errors="coerce")
-                e_hora_fin = st.time_input("Hora fin (edit)", value=(raw_fin.time() if pd.notna(raw_fin) else (datetime.combine(date.today(), e_hora)+timedelta(hours=2)).time()), key="e_hora_fin")
+                e_fecha = st.date_input("Fecha (edit)", value=parse_date_any(row["Fecha"]) or date.today(), key="e_fecha")
+                e_hora  = st.time_input("Hora (edit)",  value=parse_time_any(row["Hora"]) or time(10,0), key="e_hora")
+                raw_fin = parse_time_any(row.get("Hora fin"))
+                e_hora_fin = st.time_input("Hora fin (edit)", value=raw_fin or (datetime.combine(date.today(), e_hora)+timedelta(hours=2)).time(), key="e_hora_fin")
                 e_nombre = st.text_input("Nombre (edit)", value=row.get("Nombre",""), key="e_nombre")
                 e_colonia = st.text_input("Colonia/Zona (edit)", value=row.get("Colonia/Zona",""), key="e_colonia")
             with ec2:
@@ -684,10 +723,12 @@ with tabs[1]:
                     "Sí" if e_addon else "No", e_margen, "Sí" if e_retro else "No",
                     e_cv, e_notas, e_status
                 ]
-                save_db(dfs)
+                save_db(dfs); set_dfs(dfs)
                 st.success("Cambios guardados.")
                 del st.session_state["edit_id"]
+                reload_from_disk(); st.rerun()
 
+        # CSV solo lee la vista tipada; NO toca la base
         ev_csv = listado.drop(columns=["Seleccionar"], errors="ignore").to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Descargar CSV de eventos", data=ev_csv, file_name="eventos.csv", mime="text/csv")
     else:
@@ -695,6 +736,7 @@ with tabs[1]:
 
 # --- Agenda (FullCalendar) ---
 with tabs[2]:
+    dfs = get_dfs()
     st.subheader("Agenda (estilo Google Calendar)")
     st.caption("Se construye desde 📒 Eventos. Click para ver datos y mapa.")
     ev = dfs["Event_Log"].copy()
@@ -717,6 +759,7 @@ with tabs[2]:
 
 # --- Ads & Funnel ---
 with tabs[3]:
+    dfs = get_dfs()
     st.subheader("Ads & Funnel")
     st.caption("Captura mensual y métricas derivadas.")
     with st.expander("📣 Ads", True):
@@ -738,7 +781,7 @@ with tabs[3]:
                 else:
                     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
                 dfs["Ads"] = df
-                save_db(dfs)
+                save_db(dfs); set_dfs(dfs)
                 st.success("Ads actualizado.")
         with mcol2:
             df = dfs["Ads"].copy()
@@ -766,7 +809,7 @@ with tabs[3]:
                 else:
                     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
                 dfs["Funnel"] = df
-                save_db(dfs)
+                save_db(dfs); set_dfs(dfs)
                 st.success("Funnel actualizado.")
         with fcol2:
             df = dfs["Funnel"].copy()
@@ -778,17 +821,19 @@ with tabs[3]:
 
 # --- Configuración ---
 with tabs[4]:
+    dfs = get_dfs()
     st.subheader("Assumptions (editar)")
     assum = dfs["Assumptions"].copy()
     st.caption("Edita los valores y presiona Guardar para aplicar.")
     edited = st.data_editor(assum, use_container_width=True, num_rows="dynamic")
     if st.button("💾 Guardar Assumptions"):
         dfs["Assumptions"] = edited
-        save_db(dfs)
+        save_db(dfs); set_dfs(dfs)
         st.success("Assumptions guardado.")
 
 # --- Datos (ver/exportar) ---
 with tabs[5]:
+    dfs = get_dfs()
     st.subheader("Hojas de la base de datos")
     for name in ["Monthly","Event_Log","Ads","Funnel","Summary"]:
         st.markdown(f"#### {name}")
@@ -804,5 +849,4 @@ with tabs[5]:
                            file_name=f"{name}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("GAME BUS MTY V.2025 — ahora con Hora fin 😎")
-
+st.caption("GAME BUS MTY V.2025 — v7.5 (session_state DFS + reload inmediato)")
