@@ -1,6 +1,7 @@
 # GAME BUS MTY - Streamlit App
 # FullCalendar + Map Picker + Orden meses + Casillas + Editor
-# FIX v7.7.0 — sin recargas automáticas; persistencia en memoria tras guardar; recarga manual opcional
+# FIX v7.7.1 — sin recargas automáticas; memoria primero; recarga manual opcional
+# + KPI extra en Dashboard: Ingresos agendados (todos los eventos del año, sin importar estatus)
 
 import streamlit as st
 import pandas as pd
@@ -24,7 +25,7 @@ except Exception:
     HAS_MAP = False
 
 st.set_page_config(page_title="GAME BUS MTY", page_icon="🎮", layout="wide")
-print(">> GAME BUS MTY app - FIX v7.7.0")
+print(">> GAME BUS MTY app - FIX v7.7.1")
 
 DB_PATH = "GameBus_DB.xlsx"
 
@@ -537,14 +538,27 @@ tabs = st.tabs(["📊 Dashboard","📒 Eventos (captura)","🗓️ Agenda (calen
 with tabs[0]:
     dfs = get_dfs()
     st.subheader("KPIs del año (hasta mes actual, solo Efectuados)")
+
     monthly = compute_monthly(dfs)
     monthly["Mes"] = pd.Categorical(monthly["Mes"], categories=SPANISH_MONTHS, ordered=True)
     monthly = monthly.sort_values("Mes")
     e,i,u = kpi_summary(monthly)
-    c1,c2,c3 = st.columns(3)
+
+    # NUEVO: Ingreso total agendado (todos los eventos del año, sin importar Estatus)
+    ev_all = dfs["Event_Log"].copy()
+    ev_all["Fecha"] = pd.to_datetime(ev_all["Fecha"], errors="coerce")
+    cur_year = datetime.now().year
+    ingreso_agendado = (
+        ev_all.loc[ev_all["Fecha"].dt.year == cur_year, "Precio (MXN)"]
+        .fillna(0)
+        .sum()
+    )
+
+    c1,c2,c3,c4 = st.columns(4)
     c1.metric("Eventos totales", int(e))
     c2.metric("Ingresos totales (MXN)", f"{i:,.0f}")
     c3.metric("Utilidad neta (MXN)", f"{u:,.0f}")
+    c4.metric("Ingresos agendados (MXN)", f"{ingreso_agendado:,.0f}")
 
     st.markdown("---")
     idx = monthly.set_index("Mes").reindex(SPANISH_MONTHS).fillna(0)
@@ -883,4 +897,4 @@ with tabs[5]:
                            file_name=f"{name}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("GAME BUS MTY V.2025 — v7.7.0 (sin recargas automáticas; memoria primero; recarga manual opcional)")
+st.caption("GAME BUS MTY V.2025 — v7.7.1 (memoria primero + KPI Ingresos agendados)")
