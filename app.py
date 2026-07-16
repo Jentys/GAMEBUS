@@ -160,7 +160,13 @@ def load_db_from_postgres():
 
     dfs = {}
     for _, row in result.iterrows():
-        payload = json.loads(row["data_json"])
+        payload = row["data_json"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        elif isinstance(payload, (bytes, bytearray)):
+            payload = json.loads(payload.decode("utf-8"))
+        elif payload is None:
+            payload = []
         dfs[row["sheet_name"]] = pd.DataFrame.from_records(payload)
 
     for needed in ["Assumptions","Monthly","Ads","Funnel","Event_Log","Summary"]:
