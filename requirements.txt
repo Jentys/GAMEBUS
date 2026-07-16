@@ -6,3 +6,5 @@ requests
 folium
 streamlit-folium
 XlsxWriter>=3.2.0
+sqlalchemy
+psycopg2-binary

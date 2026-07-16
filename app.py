@@ -12,6 +12,7 @@ import io
 import os
 from urllib.parse import quote_plus
 import tempfile, shutil  # guardado atómico
+from sqlalchemy import create_engine, text
 
 # --- compat rerun (algunas versiones no tienen experimental_rerun) ---
 RERUN = getattr(st, "rerun", lambda: None)
@@ -34,6 +35,32 @@ MONTH_NAME_MAP = {i+1: m for i, m in enumerate(SPANISH_MONTHS)}
 APPLY_FIXED_FROM_MONTH = 10  # Octubre
 
 # ---------- Helpers ----------
+def get_database_url():
+    try:
+        if hasattr(st, "secrets") and "database" in st.secrets:
+            return st.secrets["database"].get("url") or os.getenv("DATABASE_URL")
+    except Exception:
+        pass
+    return os.getenv("DATABASE_URL")
+
+
+def get_db_engine():
+    db_url = get_database_url()
+    if not db_url:
+        return None
+    return create_engine(db_url, pool_pre_ping=True)
+
+
+def ensure_postgres_schema(engine):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS sheet_store (
+                sheet_name TEXT PRIMARY KEY,
+                data_json JSONB NOT NULL
+            )
+        """))
+
+
 def normalize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -119,7 +146,38 @@ def reverse_geocode(lat: float, lon: float) -> str:
         pass
     return ""
 
+def load_db_from_postgres():
+    engine = get_db_engine()
+    if not engine:
+        return None
+
+    ensure_postgres_schema(engine)
+    with engine.connect() as conn:
+        result = pd.read_sql("SELECT sheet_name, data_json FROM sheet_store ORDER BY sheet_name", conn)
+
+    if result.empty:
+        return None
+
+    dfs = {}
+    for _, row in result.iterrows():
+        payload = json.loads(row["data_json"])
+        dfs[row["sheet_name"]] = pd.DataFrame.from_records(payload)
+
+    for needed in ["Assumptions","Monthly","Ads","Funnel","Event_Log","Summary"]:
+        if needed not in dfs:
+            dfs[needed] = pd.DataFrame()
+
+    dfs["Event_Log"] = ensure_eventlog_columns(dfs.get("Event_Log", pd.DataFrame()))
+    return dfs
+
+
 def load_db(path=DB_PATH):
+    db_url = get_database_url()
+    if db_url:
+        dfs = load_db_from_postgres()
+        if dfs is not None:
+            return dfs
+
     if not os.path.exists(path):
         st.error("No se encontró la base de datos. Sube tu archivo o reinicia la app.")
         st.stop()
@@ -133,6 +191,25 @@ def load_db(path=DB_PATH):
 
 # --- Guardado atómico ---
 def save_db_atomic(dfs, path=DB_PATH):
+    db_url = get_database_url()
+    if db_url:
+        engine = get_db_engine()
+        if engine is not None:
+            ensure_postgres_schema(engine)
+            with engine.begin() as conn:
+                for name, df in dfs.items():
+                    payload = df.to_json(orient="records", date_format="iso")
+                    conn.execute(
+                        text("""
+                            INSERT INTO sheet_store (sheet_name, data_json)
+                            VALUES (:sheet_name, CAST(:payload AS JSONB))
+                            ON CONFLICT (sheet_name)
+                            DO UPDATE SET data_json = EXCLUDED.data_json
+                        """),
+                        {"sheet_name": name, "payload": payload}
+                    )
+            return
+
     """Escritura atómica a XLSX y reemplazo seguro: evita archivos truncados."""
     dir_name = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp_path = tempfile.mkstemp(prefix="gamebus_", suffix=".xlsx", dir=dir_name)

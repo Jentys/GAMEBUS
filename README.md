@@ -28,6 +28,22 @@ Esta app de **Streamlit** te permite operar y medir tu negocio *GAME BUS MTY* co
    ```
 3. La app usará el archivo `GameBus_DB.xlsx` en la misma carpeta. Puedes subir otro desde la **barra lateral** si así lo prefieres.
 
+## Base persistente en Neon (recomendada)
+Si tu instancia de Streamlit se duerme o reinicia, el archivo local `GameBus_DB.xlsx` deja de ser una fuente confiable de persistencia. Para que la base no desaparezca, usa Neon Postgres y configura la cadena de conexión:
+
+```bash
+DATABASE_URL=postgresql://<usuario>:<password>@<host>/<db>?sslmode=require
+```
+
+O en Streamlit Cloud, en `.streamlit/secrets.toml`:
+
+```toml
+[database]
+url = "postgresql://<usuario>:<password>@<host>/<db>?sslmode=require"
+```
+
+Si `DATABASE_URL` no está configurada, la app sigue funcionando con `GameBus_DB.xlsx` como respaldo local.
+
 ## Notas de cálculo
 - **Monthly** se **calcula** a partir de *Event_Log* (conteo de eventos, ingresos, costos variables, adopción Retro, etc.) y de **Assumptions** (gastos fijos mensuales, costo variable default si falta capturarlo en algún evento).
 - **Utilidad neta** = Ingresos − Costo variable − Gastos fijos + Margen Pizza.
