@@ -28,7 +28,20 @@ except Exception:
 st.set_page_config(page_title="GAME BUS MTY", page_icon="🎮", layout="wide")
 print(">> GAME BUS MTY app - FIX v7.7.1")
 
-DB_PATH = "GameBus_DB.xlsx"
+
+def resolve_db_path():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, "GameBus_DB.xlsx"),
+        os.path.join(base_dir, "..", "GameBus_DB.xlsx"),
+        os.path.join(base_dir, "..", "..", "GameBus_DB.xlsx"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+DB_PATH = resolve_db_path()
 
 SPANISH_MONTHS = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
 MONTH_NAME_MAP = {i+1: m for i, m in enumerate(SPANISH_MONTHS)}
