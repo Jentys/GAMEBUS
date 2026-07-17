@@ -51,10 +51,21 @@ APPLY_FIXED_FROM_MONTH = 10  # Octubre
 def get_database_url():
     try:
         if hasattr(st, "secrets") and "database" in st.secrets:
-            return st.secrets["database"].get("url") or os.getenv("DATABASE_URL")
+            url = st.secrets["database"].get("url") or os.getenv("DATABASE_URL")
+            return normalize_database_url(url)
     except Exception:
         pass
-    return os.getenv("DATABASE_URL")
+    return normalize_database_url(os.getenv("DATABASE_URL"))
+
+
+def normalize_database_url(url):
+    """Normalize legacy Postgres URLs for SQLAlchemy."""
+    if not url:
+        return None
+    url = str(url).strip()
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
 
 
 def get_db_engine():
@@ -209,21 +220,13 @@ def load_db_from_postgres():
     return dfs
 
 
-def load_db(path=DB_PATH):
-    db_url = get_database_url()
-    if db_url:
-        dfs = load_db_from_postgres()
-        if dfs is not None:
-            return dfs
-
-    if not os.path.exists(path):
-        st.error("No se encontró la base de datos. Sube tu archivo o reinicia la app.")
-        st.stop()
-    xls = pd.ExcelFile(path)
+def load_db_from_excel(source=DB_PATH):
+    """Load and canonicalize every sheet from a path or in-memory workbook."""
+    xls = pd.ExcelFile(source)
     dfs = {}
     for name in xls.sheet_names:
         canonical = canonical_sheet_name(name)
-        df = pd.read_excel(path, sheet_name=name)
+        df = pd.read_excel(source, sheet_name=name)
         if canonical in dfs:
             dfs[canonical] = pd.concat([dfs[canonical], df], ignore_index=True)
         else:
@@ -234,26 +237,50 @@ def load_db(path=DB_PATH):
     dfs["Event_Log"] = ensure_eventlog_columns(dfs.get("Event_Log", pd.DataFrame()))
     return dfs
 
+
+def save_db_to_postgres(dfs, engine=None):
+    engine = engine or get_db_engine()
+    if engine is None:
+        raise RuntimeError("DATABASE_URL is not configured")
+    ensure_postgres_schema(engine)
+    with engine.begin() as conn:
+        for name, df in dfs.items():
+            payload = df.to_json(orient="records", date_format="iso")
+            conn.execute(
+                text("""
+                    INSERT INTO sheet_store (sheet_name, data_json)
+                    VALUES (:sheet_name, CAST(:payload AS JSONB))
+                    ON CONFLICT (sheet_name)
+                    DO UPDATE SET data_json = EXCLUDED.data_json
+                """),
+                {"sheet_name": canonical_sheet_name(name), "payload": payload}
+            )
+
+
+def load_db(path=DB_PATH):
+    db_url = get_database_url()
+    if db_url:
+        dfs = load_db_from_postgres()
+        if dfs is not None:
+            return dfs
+
+        # Seed a newly-created Neon database from the workbook once.
+        if os.path.exists(path):
+            dfs = load_db_from_excel(path)
+            save_db_to_postgres(dfs)
+            return dfs
+
+    if not os.path.exists(path):
+        st.error("No se encontró la base de datos. Sube tu archivo o reinicia la app.")
+        st.stop()
+    return load_db_from_excel(path)
+
 # --- Guardado atómico ---
 def save_db_atomic(dfs, path=DB_PATH):
     db_url = get_database_url()
     if db_url:
-        engine = get_db_engine()
-        if engine is not None:
-            ensure_postgres_schema(engine)
-            with engine.begin() as conn:
-                for name, df in dfs.items():
-                    payload = df.to_json(orient="records", date_format="iso")
-                    conn.execute(
-                        text("""
-                            INSERT INTO sheet_store (sheet_name, data_json)
-                            VALUES (:sheet_name, CAST(:payload AS JSONB))
-                            ON CONFLICT (sheet_name)
-                            DO UPDATE SET data_json = EXCLUDED.data_json
-                        """),
-                        {"sheet_name": name, "payload": payload}
-                    )
-            return
+        save_db_to_postgres(dfs)
+        return
 
     """Escritura atómica a XLSX y reemplazo seguro: evita archivos truncados."""
     dir_name = os.path.dirname(os.path.abspath(path)) or "."
@@ -628,22 +655,29 @@ st.title("🎮 GAME BUS MTY - PERFORMANCE APP")
 # Sidebar
 with st.sidebar:
     st.header("Base de datos")
+    using_neon = bool(get_database_url())
+    st.caption("Persistencia activa: Neon PostgreSQL" if using_neon else "Persistencia activa: Excel local")
     uploaded = st.file_uploader("Subir base (GameBus_DB.xlsx)", type=["xlsx"], accept_multiple_files=False)
     if uploaded:
-        with open(DB_PATH, "wb") as f:
-            f.write(uploaded.read())
-        # Recarga explícita SOLO cuando el usuario sube un archivo
-        st.session_state["dfs"] = load_db()
-        st.success("Base actualizada desde archivo subido.")
+        uploaded_bytes = uploaded.getvalue()
+        imported_dfs = load_db_from_excel(io.BytesIO(uploaded_bytes))
+        if using_neon:
+            save_db_to_postgres(imported_dfs)
+            st.success("Excel importado correctamente a Neon.")
+        else:
+            with open(DB_PATH, "wb") as f:
+                f.write(uploaded_bytes)
+            st.success("Base Excel actualizada.")
+        st.session_state["dfs"] = imported_dfs
 
     dfs = get_dfs()
     if st.button("💾 Guardar ahora"):
         save_db(dfs)
-        st.success("Base guardada en disco (se mantiene la versión en memoria).")
+        st.success("Base guardada en Neon." if using_neon else "Base guardada en Excel.")
 
-    if st.button("🔄 Recargar desde disco"):
+    if st.button("🔄 Recargar desde Neon" if using_neon else "🔄 Recargar desde Excel"):
         st.session_state["dfs"] = load_db()
-        st.success("Base recargada desde disco.")
+        st.success("Base recargada desde Neon." if using_neon else "Base recargada desde Excel.")
 
     if st.button("⬇️ Exportar Excel completo"):
         bio = io.BytesIO()

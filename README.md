@@ -44,6 +44,11 @@ url = "postgresql://<usuario>:<password>@<host>/<db>?sslmode=require"
 
 Si `DATABASE_URL` no está configurada, la app sigue funcionando con `GameBus_DB.xlsx` como respaldo local.
 
+En la primera ejecución con Neon vacío, la app importa automáticamente el
+`GameBus_DB.xlsx` incluido en el proyecto. Después, Neon se convierte en la fuente
+principal. También puedes usar **Subir base** para importar otro archivo Excel a
+Neon; descarga antes una copia de seguridad si ya tienes capturas.
+
 ## Notas de cálculo
 - **Monthly** se **calcula** a partir de *Event_Log* (conteo de eventos, ingresos, costos variables, adopción Retro, etc.) y de **Assumptions** (gastos fijos mensuales, costo variable default si falta capturarlo en algún evento).
 - **Utilidad neta** = Ingresos − Costo variable − Gastos fijos + Margen Pizza.
