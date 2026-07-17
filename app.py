@@ -79,6 +79,20 @@ def month_to_num(mes_str: str) -> int:
     except Exception:
         return 0
 
+
+def canonical_sheet_name(name):
+    if name is None:
+        return name
+    key = str(name).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "event_log": "Event_Log",
+        "events_log": "Event_Log",
+        "events_logs": "Event_Log",
+        "event_logs": "Event_Log",
+        "eventlog": "Event_Log",
+    }
+    return aliases.get(key, str(name).strip())
+
 # --- Parsers robustos para editor/agenda ---
 def parse_date_any(x):
     if x is None or (isinstance(x, str) and not x.strip()):
@@ -167,7 +181,12 @@ def load_db_from_postgres():
             payload = json.loads(payload.decode("utf-8"))
         elif payload is None:
             payload = []
-        dfs[row["sheet_name"]] = pd.DataFrame.from_records(payload)
+        sheet_name = canonical_sheet_name(row["sheet_name"])
+        df = pd.DataFrame.from_records(payload)
+        if sheet_name in dfs:
+            dfs[sheet_name] = pd.concat([dfs[sheet_name], df], ignore_index=True)
+        else:
+            dfs[sheet_name] = df
 
     for needed in ["Assumptions","Monthly","Ads","Funnel","Event_Log","Summary"]:
         if needed not in dfs:
@@ -188,7 +207,14 @@ def load_db(path=DB_PATH):
         st.error("No se encontró la base de datos. Sube tu archivo o reinicia la app.")
         st.stop()
     xls = pd.ExcelFile(path)
-    dfs = {name: pd.read_excel(path, sheet_name=name) for name in xls.sheet_names}
+    dfs = {}
+    for name in xls.sheet_names:
+        canonical = canonical_sheet_name(name)
+        df = pd.read_excel(path, sheet_name=name)
+        if canonical in dfs:
+            dfs[canonical] = pd.concat([dfs[canonical], df], ignore_index=True)
+        else:
+            dfs[canonical] = df
     for needed in ["Assumptions","Monthly","Ads","Funnel","Event_Log","Summary"]:
         if needed not in dfs:
             dfs[needed] = pd.DataFrame()
